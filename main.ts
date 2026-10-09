@@ -1,9 +1,9 @@
 // Define multiple upstream fallbacks to bypass localized IP/Proxy bans
 const UPSTREAM_POOL = [
   "https://now.gg",
-  "https://us.now.gg",
-  "https://eu.now.gg",
-  "https://unblock.now.gg" // Standard historical mirrors used for resilience
+  "https://now.gg",
+  "https://now.gg",
+  "https://now.gg" // Standard historical mirrors used for resilience
 ];
 
 const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
@@ -59,6 +59,7 @@ async function isDetectionScreen(response: Response): Promise<{ detected: boolea
     // Match typical Cloudflare / Now.gg anti-bot and proxy keywords
     const matchesPattern = 
       lowText.includes("vpn or proxy") || 
+      lowText.includes("vpn/proxy") ||
       lowText.includes("unusual traffic") || 
       lowText.includes("checking your browser") || 
       lowText.includes("enable javascript") ||
@@ -127,7 +128,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     requestHeaders.set("origin", currentUpstream);
     requestHeaders.set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-    // Explicitly delete proxy tracking footprints typically added by Deno Deploy/Cloudflare
+    // Explicitly delete proxy tracking footprints typically added by server setups
     requestHeaders.delete("x-forwarded-for");
     requestHeaders.delete("x-real-ip");
     requestHeaders.delete("forwarded");
@@ -150,13 +151,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
         redirect: "manual",
       });
 
-      // 1. Intercept HTTP Status blocks (403 Forbidden / 503 Service Unavailable / 429 Rate Limited)
-      // 2. Intercept 200 OK screens containing stealth Javascript/Cloudflare detection challenges
+      // Scan status codes and content bodies to identify hidden intercept blocks
       const check = await isDetectionScreen(upstreamResponse);
       const isBadStatus = [403, 429, 503].includes(upstreamResponse.status);
 
       if (isBadStatus || check.detected) {
-        console.warn(`[Block Detected] Host ${currentUpstream} failed. Trying next fallback option...`);
+        console.warn(`[Block Detected] Host ${currentUpstream} failed evaluation. Trying next fallback option...`);
         continue; // Drop current iteration, proceed to next host in pool
       }
 
