@@ -1,13 +1,13 @@
-const http = require('http');
-const https = require('https');
+// Use standard ESM imports with the node: compatibility prefix
+import http from "node:http";
+import https from "node:https";
 
 // Configuration
 const PORT = 8080;
 const UPSTREAM = "https://now.gg";
 const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
 
-// Helper for default CORS headers
-function getCorsHeaders() {
+function getCorsHeaders(): Record<string, string> {
     return {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -15,9 +15,7 @@ function getCorsHeaders() {
     };
 }
 
-// 1. Correct URL Routing Logic (Fixed to handle local -> upstream mappings seamlessly)
-function resolveTarget(incoming) {
-    // If requesting through an explicit proxy path
+function resolveTarget(incoming: URL): URL {
     if (incoming.pathname.startsWith("/proxy/")) {
         const encoded = incoming.pathname.slice("/proxy/".length);
         const target = new URL(decodeURIComponent(encoded));
@@ -37,7 +35,6 @@ function resolveTarget(incoming) {
         return target;
     }
 
-    // Default fallback to the main Roblox application path
     const path = (incoming.pathname === "/" || incoming.pathname === "/index.html")
         ? ROBLOX_DEFAULT_PATH
         : incoming.pathname;
@@ -45,62 +42,49 @@ function resolveTarget(incoming) {
     return new URL(path + incoming.search, UPSTREAM);
 }
 
-// 2. The Main Proxy Request Handler
 const server = http.createServer((req, res) => {
-    // Handle preflight OPTIONS requests immediately
     if (req.method === 'OPTIONS') {
         res.writeHead(204, getCorsHeaders());
         res.end();
         return;
     }
 
-    let target;
+    let target: URL;
     try {
-        // Construct the full local URL to parse out parameters reliably
-        const incomingUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        const incomingUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
         target = resolveTarget(incomingUrl);
-    } catch (err) {
+    } catch (err: any) {
         res.writeHead(400, { 'Content-Type': 'text/plain', ...getCorsHeaders() });
         res.end(`Invalid or forbidden upstream URL: ${err.message}`);
         return;
     }
 
-    // Construct the outbound headers safely
     const outboundHeaders = { ...req.headers };
     outboundHeaders['host'] = target.host;
     
-    // Do not attempt network-level IP spoofing via headers as upstreams look at the socket layer.
-    // Clean out potential conflicting headers to maintain protocol integrity.
+    // Clean infrastructure headers
     delete outboundHeaders['x-forwarded-for'];
     delete outboundHeaders['x-forwarded-proto'];
     delete outboundHeaders['x-forwarded-host'];
 
-    // Options for the HTTPS forward request
     const options = {
         method: req.method,
         headers: outboundHeaders,
     };
 
-    // Forward the request to the upstream target safely over HTTPS
     const upstreamReq = https.request(target, options, (upstreamRes) => {
         const responseHeaders = { ...upstreamRes.headers, ...getCorsHeaders() };
 
-        // Fix 3. Correct Redirect Handling
-        // If the upstream issues a 301/302 redirect, check if it drops the hostname.
-        // We route cross-origin redirects through our local proxy routing endpoint to preserve server tracking.
-        if ([301, 302, 303, 307, 308].includes(upstreamRes.statusCode) && responseHeaders.location) {
+        if (upstreamRes.statusCode && [301, 302, 307, 308].includes(upstreamRes.statusCode) && responseHeaders.location) {
             try {
                 const redirectUrl = new URL(responseHeaders.location, target.href);
-                // Rewrite location to keep the user trapped inside the local proxy context safely
                 responseHeaders.location = `/proxy/${encodeURIComponent(redirectUrl.href)}`;
-            } catch (e) {
-                // If it fails parsing, keep original header to avoid breaking standard pathways
+            } catch {
+                // Keep default routing path if fallback parsing misses
             }
         }
 
-        // Fix 4. Remove fragile DOM injections. 
-        // Stream the data completely unmodified to preserve iframe sandboxes, window.top hierarchy, and script layouts.
-        res.writeHead(upstreamRes.statusCode, responseHeaders);
+        res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
         upstreamRes.pipe(res);
     });
 
@@ -110,12 +94,10 @@ const server = http.createServer((req, res) => {
         res.end('Bad Gateway: Proxy server could not communicate with the upstream.');
     });
 
-    // Pipe the client's original payload (POST bodies, uploads) up to the target
     req.pipe(upstreamReq);
 });
 
-// Launch Server
 server.listen(PORT, () => {
-    console.log(`Proxy listening on port: ${PORT}`);
-    console.log(`Default Application entry: http://localhost:${PORT}/`);
+    console.log(`Proxy server successfully running under Deno.`);
+    console.log(`Listening on local entry: http://localhost:${PORT}/`);
 });
