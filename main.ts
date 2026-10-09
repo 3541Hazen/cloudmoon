@@ -4,7 +4,7 @@ import https from "node:https";
 
 // Configuration
 const PORT = 8080;
-const UPSTREAM = "https://nowgg.lol";
+const UPSTREAM = "https://now.gg";
 const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
 
 function getCorsHeaders(): Record<string, string> {
@@ -12,6 +12,7 @@ function getCorsHeaders(): Record<string, string> {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Credentials": "true"
   };
 }
 
@@ -19,77 +20,21 @@ function resolveTarget(incoming: URL): URL {
   if (incoming.pathname.startsWith("/proxy/")) {
     const encoded = incoming.pathname.slice("/proxy/".length);
     const target = new URL(decodeURIComponent(encoded));
-
     if (target.protocol !== "https:") {
       throw new Error("Only HTTPS upstream URLs are allowed");
     }
-
-    if (target.hostname !== "nowgg.lol" && !target.hostname.endsWith(".nowgg.lol")) {
+    if (target.hostname !== "now.gg" && !target.hostname.endsWith(".now.gg")) {
       throw new Error("Forbidden upstream host");
     }
-
     if (incoming.search) {
       target.search = incoming.search;
     }
     return target;
   }
-
-  const path = (incoming.pathname === "/" || incoming.pathname === "/index.html")
-    ? ROBLOX_DEFAULT_PATH
+  const path = (incoming.pathname === "/" || incoming.pathname === "/index.html") 
+    ? ROBLOX_DEFAULT_PATH 
     : incoming.pathname;
-
   return new URL(path + incoming.search, UPSTREAM);
-}
-
-// Serves the full-screen iframe template with a loading overlay for the root layout
-function getHtmlTemplate(targetUrl: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NowGG Proxy Base</title>
-  <style>
-    * { box-sizing: border-box; }
-    html, body {
-      margin: 0; padding: 0; width: 100%; height: 100%;
-      background-color: #0f0f12; font-family: sans-serif; overflow: hidden;
-    }
-    #loading-screen {
-      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-      background-color: #121214; display: flex; flex-direction: column;
-      align-items: center; justify-content: center; z-index: 9999;
-      transition: opacity 0.5s ease, transform 0.5s ease; color: #fff;
-    }
-    .spinner {
-      width: 50px; height: 50px; border: 5px solid #27272a;
-      border-top: 5px solid #6366f1; border-radius: 50%;
-      animation: spin 1s linear infinite; margin-bottom: 20px;
-    }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    iframe {
-      width: 100%; height: 100%; border: none; display: block;
-      background-color: transparent;
-    }
-    .fade-out { opacity: 0; pointer-events: none; transform: scale(1.05); }
-  </style>
-</head>
-<body>
-  <div id="loading-screen">
-    <div class="spinner"></div>
-    <div style="font-weight: 600; letter-spacing: 0.5px;">Loading Upstream Client...</div>
-  </div>
-  <iframe id="game-frame" src="${targetUrl}"></iframe>
-  <script>
-    const frame = document.getElementById('game-frame');
-    const loader = document.getElementById('loading-screen');
-    frame.addEventListener('load', () => {
-      loader.classList.add('fade-out');
-      setTimeout(() => loader.remove(), 500);
-    });
-  </script>
-</body>
-</html>`;
 }
 
 const server = http.createServer((req, res) => {
@@ -102,15 +47,6 @@ const server = http.createServer((req, res) => {
   let target: URL;
   try {
     const incomingUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    
-    // Intercept root page loads to wrap the app runtime inside an iframe container
-    if (incomingUrl.pathname === "/" || incomingUrl.pathname === "/index.html") {
-      const embeddedUrl = `/proxy/${encodeURIComponent(UPSTREAM + ROBLOX_DEFAULT_PATH + incomingUrl.search)}`;
-      res.writeHead(200, { "Content-Type": "text/html", ...getCorsHeaders() });
-      res.end(getHtmlTemplate(embeddedUrl));
-      return;
-    }
-
     target = resolveTarget(incomingUrl);
   } catch (err: any) {
     res.writeHead(400, { "Content-Type": "text/plain", ...getCorsHeaders() });
@@ -118,13 +54,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const outboundHeaders = { ...req.headers };
-  outboundHeaders["host"] = target.host;
+  // Bypassing detection by constructing completely clean, stealthy headers
+  const outboundHeaders: Record<string, string> = {};
 
-  // Clean infrastructure headers
-  delete outboundHeaders["x-forwarded-for"];
-  delete outboundHeaders["x-forwarded-proto"];
-  delete outboundHeaders["x-forwarded-host"];
+  // 1. Spoof target context & break cloud proxy signatures
+  outboundHeaders["host"] = target.host;
+  outboundHeaders["origin"] = "https://now.gg";
+  outboundHeaders["referer"] = "https://now.gg";
+
+  // 2. Pass standard runtime headers if they exist, but pass clean fallbacks
+  outboundHeaders["user-agent"] = (req.headers["user-agent"] as string) || 
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  
+  if (req.headers["accept"]) outboundHeaders["accept"] = req.headers["accept"] as string;
+  if (req.headers["accept-language"]) outboundHeaders["accept-language"] = req.headers["accept-language"] as string;
+  if (req.headers["accept-encoding"]) outboundHeaders["accept-encoding"] = req.headers["accept-encoding"] as string;
+  if (req.headers["content-type"]) outboundHeaders["content-type"] = req.headers["content-type"] as string;
+  if (req.headers["cookie"]) outboundHeaders["cookie"] = req.headers["cookie"] as string;
+
+  // 3. Append Client Hints to look like a standard Google Chrome asset request
+  outboundHeaders["sec-ch-ua"] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
+  outboundHeaders["sec-ch-ua-mobile"] = "?0";
+  outboundHeaders["sec-ch-ua-platform"] = '"Windows"';
+  outboundHeaders["sec-fetch-dest"] = "document";
+  outboundHeaders["sec-fetch-mode"] = "navigate";
+  outboundHeaders["sec-fetch-site"] = "none";
+  outboundHeaders["sec-fetch-user"] = "?1";
+  outboundHeaders["upgrade-insecure-requests"] = "1";
 
   const options = {
     method: req.method,
@@ -133,6 +89,10 @@ const server = http.createServer((req, res) => {
 
   const upstreamReq = https.request(target, options, (upstreamRes) => {
     const responseHeaders = { ...upstreamRes.headers, ...getCorsHeaders() };
+
+    // Update CSP and Frame options to prevent your site context from getting blocked locally
+    delete responseHeaders["content-security-policy"];
+    delete responseHeaders["x-frame-options"];
 
     if (upstreamRes.statusCode && [301, 302, 307, 308].includes(upstreamRes.statusCode) && responseHeaders.location) {
       try {
@@ -148,7 +108,7 @@ const server = http.createServer((req, res) => {
   });
 
   upstreamReq.on("error", (err) => {
-    console.error("Upstream Request Error:", err);
+    console.error("Upstream Request Error: ", err);
     res.writeHead(502, { "Content-Type": "text/plain", ...getCorsHeaders() });
     res.end("Bad Gateway: Proxy server could not communicate with the upstream.");
   });
