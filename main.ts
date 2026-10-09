@@ -1,103 +1,205 @@
-// Use standard ESM imports with the node: compatibility prefix
-import http from "node:http";
-import https from "node:https";
 
-// Configuration
-const PORT = 8080;
 const UPSTREAM = "https://now.gg";
-const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
+const ROBLOX_DEFAULT_PATH =
+  "/apps/roblox-corporation/2349/roblox.html";
 
-function getCorsHeaders(): Record<string, string> {
-    return {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': '*'
-    };
+const BLOCKED_HOSTS = [
+  "googlesyndication",
+  "doubleclick",
+  "googleadservices",
+  "google-analytics",
+  "googletagmanager",
+  "googletagservices",
+  "adservice.google",
+  "adnxs",
+  "advertising.com",
+  "outbrain",
+  "taboola",
+  "criteo",
+  "pubmatic",
+  "openx",
+  "amazon-adsystem",
+  "popads",
+  "popcash",
+  "adcolony",
+  "unityads",
+  "ironsrc",
+  "applovin",
+  "vungle",
+  "adroll",
+  "quantserve",
+  "scorecardresearch",
+];
+
+function corsHeaders(): Headers {
+  return new Headers({
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods":
+      "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization, Accept, Range, If-None-Match",
+  });
 }
 
-function resolveTarget(incoming: URL): URL {
+function isAllowedHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "now.gg" || host.endsWith(".now.gg");
+}
+
+function isBlocked(url: URL): boolean {
+  const host = url.hostname.toLowerCase();
+  const path = url.pathname.toLowerCase();
+
+  return (
+    BLOCKED_HOSTS.some((item) => host.includes(item)) ||
+    /\/(ads?|advertising|telemetry|analytics|metrics|vpn-detect|fraud)(\/|$)/i.test(
+      path,
+    ) ||
+    /prebid|adblock|amplitude|fingerprint|telemetry/i.test(path)
+  );
+}
+
+function proxyPath(url: URL): string {
+  return `/proxy/${encodeURIComponent(url.href)}`;
+}
+
+Deno.serve(async (req: Request): Promise<Response> => {
+  const incoming = new URL(req.url);
+  const headers = corsHeaders();
+
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers });
+  }
+
+  if (!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(req.method)) {
+    return new Response("Method not allowed", {
+      status: 405,
+      headers,
+    });
+  }
+
+  let target: URL;
+
+  try {
     if (incoming.pathname.startsWith("/proxy/")) {
-        const encoded = incoming.pathname.slice("/proxy/".length);
-        const target = new URL(decodeURIComponent(encoded));
+      const encoded = incoming.pathname.slice("/proxy/".length);
+      target = new URL(decodeURIComponent(encoded));
 
-        if (target.protocol !== "https:") {
-            throw new Error("Only HTTPS upstream URLs are allowed");
-        }
+      // Preserve the query supplied to the proxy, if present.
+      if (incoming.search) {
+        target.search = incoming.search;
+      }
+    } else {
+      let path = incoming.pathname;
 
-        if (target.hostname !== "now.gg" && !target.hostname.endsWith(".now.gg")) {
-            throw new Error("Forbidden upstream host");
-        }
+      if (path === "/" || path === "/index.html") {
+        path = ROBLOX_DEFAULT_PATH;
+      }
 
-        if (incoming.search) {
-            target.search = incoming.search;
-        }
-
-        return target;
+      target = new URL(path + incoming.search, UPSTREAM);
     }
+  } catch {
+    return new Response("Bad URL", {
+      status: 400,
+      headers,
+    });
+  }
 
-    const path = (incoming.pathname === "/" || incoming.pathname === "/index.html")
-        ? ROBLOX_DEFAULT_PATH
-        : incoming.pathname;
+  if (target.protocol !== "https:" || !isAllowedHost(target.hostname)) {
+    return new Response("Forbidden upstream origin", {
+      status: 403,
+      headers,
+    });
+  }
 
-    return new URL(path + incoming.search, UPSTREAM);
-}
+  if (isBlocked(target)) {
+    return new Response(null, {
+      status: 204,
+      headers,
+    });
+  }
 
-const server = http.createServer((req, res) => {
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204, getCorsHeaders());
-        res.end();
-        return;
+  const requestHeaders = new Headers();
+
+  for (const name of [
+    "accept",
+    "accept-language",
+    "cache-control",
+    "content-type",
+    "range",
+    "if-none-match",
+    "if-modified-since",
+  ]) {
+    const value = req.headers.get(name);
+    if (value !== null) {
+      requestHeaders.set(name, value);
     }
+  }
 
-    let target: URL;
-    try {
-        const incomingUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-        target = resolveTarget(incomingUrl);
-    } catch (err: any) {
-        res.writeHead(400, { 'Content-Type': 'text/plain', ...getCorsHeaders() });
-        res.end(`Invalid or forbidden upstream URL: ${err.message}`);
-        return;
-    }
+  requestHeaders.set("referer", UPSTREAM + "/");
 
-    const outboundHeaders = { ...req.headers };
-    outboundHeaders['host'] = target.host;
-    
-    // Clean infrastructure headers
-    delete outboundHeaders['x-forwarded-for'];
-    delete outboundHeaders['x-forwarded-proto'];
-    delete outboundHeaders['x-forwarded-host'];
-
-    const options = {
-        method: req.method,
-        headers: outboundHeaders,
-    };
-
-    const upstreamReq = https.request(target, options, (upstreamRes) => {
-        const responseHeaders = { ...upstreamRes.headers, ...getCorsHeaders() };
-
-        if (upstreamRes.statusCode && [301, 302, 307, 308].includes(upstreamRes.statusCode) && responseHeaders.location) {
-            try {
-                const redirectUrl = new URL(responseHeaders.location, target.href);
-                responseHeaders.location = `/proxy/${encodeURIComponent(redirectUrl.href)}`;
-            } catch {
-                // Keep default routing path if fallback parsing misses
-            }
-        }
-
-        res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
-        upstreamRes.pipe(res);
+  try {
+    const upstreamResponse = await fetch(target, {
+      method: req.method,
+      headers: requestHeaders,
+      body: ["GET", "HEAD"].includes(req.method)
+        ? null
+        : req.body,
+      redirect: "manual",
     });
 
-    upstreamReq.on('error', (err) => {
-        console.error('Upstream Request Error:', err);
-        res.writeHead(502, { 'Content-Type': 'text/plain', ...getCorsHeaders() });
-        res.end('Bad Gateway: Proxy server could not communicate with the upstream.');
+    const location = upstreamResponse.headers.get("location");
+
+    if (
+      location &&
+      upstreamResponse.status >= 300 &&
+      upstreamResponse.status < 400
+    ) {
+      const destination = new URL(location, target);
+
+      if (
+        destination.protocol !== "https:" ||
+        !isAllowedHost(destination.hostname)
+      ) {
+        return new Response("Blocked external redirect", {
+          status: 502,
+          headers,
+        });
+      }
+
+      headers.set("Location", proxyPath(destination));
+
+      return new Response(null, {
+        status: upstreamResponse.status,
+        headers,
+      });
+    }
+
+    for (const name of [
+      "content-type",
+      "cache-control",
+      "etag",
+      "last-modified",
+      "content-range",
+      "accept-ranges",
+      "content-disposition",
+    ]) {
+      const value = upstreamResponse.headers.get(name);
+      if (value !== null) {
+        headers.set(name, value);
+      }
+    }
+
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers,
     });
+  } catch (error) {
+    console.error("Upstream request failed:", error);
 
-    req.pipe(upstreamReq);
-});
-
-server.listen(PORT, () => {
-    console.log(`Proxy server successfully running under Deno.`);
-    console.log(`Listening on local entry: http://localhost:${PORT}/`);
+    return new Response("Upstream request failed", {
+      status: 502,
+      headers,
+    });
+  }
 });
