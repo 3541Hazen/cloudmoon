@@ -96,7 +96,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
       } else {
         let path = incoming.pathname;
         if (path === "/" || path === "/index.html") {
-          // Point dynamically to nowgg.lol uncube partner layout
           return Response.redirect(currentUpstream + ROBLOX_DEFAULT_PATH, 302);
         }
         target = new URL(path + incoming.search, currentUpstream);
@@ -162,10 +161,15 @@ Deno.serve(async (req: Request): Promise<Response> => {
         return new Response(null, { status: upstreamResponse.status, headers });
       }
 
+      // Safe Response Header Passthrough
       for (const name of ["content-type", "cache-control", "etag", "last-modified", "content-range", "accept-ranges", "content-disposition"]) {
         const value = upstreamResponse.headers.get(name);
         if (value !== null) headers.set(name, value);
       }
+
+      // CRITICAL IFRAME UNBLOCK: Strip frame busting and clickjacking protection constraints
+      headers.delete("x-frame-options");
+      headers.delete("content-security-policy");
 
       return new Response(upstreamResponse.body, { status: upstreamResponse.status, headers });
 
