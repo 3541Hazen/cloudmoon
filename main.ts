@@ -1,155 +1,102 @@
+// Use standard ESM imports with the node: compatibility prefix
+import http from "node:http";
+import https from "node:https";
 
-const UPSTREAM_ORIGIN = "https://nowgg.lol";
-const ROBLOX_DEFAULT_PATH = "/play/uncube/7074/now?ng_ifp_partner=skool";
+// Configuration
+const PORT = 8080;
+const UPSTREAM = "https://nowgg.lol";
+const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
 
-const ALLOWED_METHODS = [
-  "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
-];
-
-const BLOCKED_HOSTS = [
-  "googlesyndication",
-  "doubleclick",
-  "googleadservices",
-  "google-analytics",
-  "googletagmanager",
-  "googletagservices",
-  "adservice.google",
-  "adnxs",
-  "advertising.com",
-  "outbrain",
-  "taboola",
-  "criteo",
-  "pubmatic",
-  "openx",
-  "amazon-adsystem",
-  "popads",
-  "popcash",
-  "adcolony",
-  "unityads",
-  "ironsrc",
-  "applovin",
-  "vungle",
-  "adroll",
-  "quantserve",
-  "scorecardresearch",
-];
-
-function corsHeaders(): Headers {
-  return new Headers({
+function getCorsHeaders(): Record<string, string> {
+  return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": ALLOWED_METHODS.join(", "),
-    "Access-Control-Allow-Headers":
-      "Content-Type, Authorization, Accept, Range, If-None-Match",
-  });
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+  };
 }
 
-function errorResponse(message: string, status: number): Response {
-  return new Response(message, { status, headers: corsHeaders() });
-}
-
-function isBlocked(url: URL): boolean {
-  const host = url.hostname.toLowerCase();
-  const path = url.pathname.toLowerCase();
-
-  return (
-    BLOCKED_HOSTS.some(
-      (item) => host === item || host.endsWith("." + item),
-    ) ||
-    /\/(ads?|advertising|telemetry|analytics|metrics)(\/|$)/i.test(path) ||
-    /prebid|adblock|amplitude|fingerprint|telemetry/i.test(path)
-  );
-}
-
-function buildEmbedPage(): string {
-  const gameUrl = UPSTREAM_ORIGIN + ROBLOX_DEFAULT_PATH;
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Roblox</title>
-  <style>
-    * { box-sizing: border-box; }
-    html, body {
-      margin: 0;
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
-      background: #111;
-    }
-    iframe {
-      display: block;
-      width: 100%;
-      height: 100%;
-      border: 0;
-    }
-  </style>
-</head>
-<body>
-  <iframe
-    src="${gameUrl}"
-    title="Roblox"
-    allow="fullscreen; autoplay; gamepad"
-    allowfullscreen
-  ></iframe>
-</body>
-</html>`;
-}
-
-Deno.serve(async (req: Request): Promise<Response> => {
-  const incoming = new URL(req.url);
-
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders() });
-  }
-
-  if (!ALLOWED_METHODS.includes(req.method)) {
-    return errorResponse("Method not allowed", 405);
-  }
-
-  if (
-    incoming.pathname === "/" ||
-    incoming.pathname === "/index.html"
-  ) {
-    const headers = corsHeaders();
-    headers.set("Content-Type", "text/html; charset=utf-8");
-    headers.set("Cache-Control", "no-store");
-
-    return new Response(buildEmbedPage(), { status: 200, headers });
-  }
-
-  // Optional filtering endpoint for requests on the configured origin.
-  if (incoming.pathname === "/filter-check") {
-    const requested = incoming.searchParams.get("url");
-
-    if (!requested) {
-      return errorResponse("Missing url parameter", 400);
-    }
-
-    let target: URL;
-
-    try {
-      target = new URL(requested);
-    } catch {
-      return errorResponse("Invalid URL", 400);
-    }
+function resolveTarget(incoming: URL): URL {
+  if (incoming.pathname.startsWith("/proxy/")) {
+    const encoded = incoming.pathname.slice("/proxy/".length);
+    const target = new URL(decodeURIComponent(encoded));
 
     if (target.protocol !== "https:") {
-      return errorResponse("HTTPS required", 403);
+      throw new Error("Only HTTPS upstream URLs are allowed");
     }
 
-    return new Response(
-      JSON.stringify({ blocked: isBlocked(target) }),
-      {
-        status: 200,
-        headers: new Headers({
-          ...Object.fromEntries(corsHeaders()),
-          "Content-Type": "application/json",
-        }),
-      },
-    );
+    if (target.hostname !== "nowgg.lol" && !target.hostname.endsWith(".nowgg.lol")) {
+      throw new Error("Forbidden upstream host");
+    }
+
+    if (incoming.search) {
+      target.search = incoming.search;
+    }
+    return target;
   }
 
-  return errorResponse("Not found", 404);
+  const path = (incoming.pathname === "/" || incoming.pathname === "/index.html")
+    ? ROBLOX_DEFAULT_PATH
+    : incoming.pathname;
+
+  return new URL(path + incoming.search, UPSTREAM);
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, getCorsHeaders());
+    res.end();
+    return;
+  }
+
+  let target: URL;
+  try {
+    const incomingUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    target = resolveTarget(incomingUrl);
+  } catch (err: any) {
+    res.writeHead(400, { "Content-Type": "text/plain", ...getCorsHeaders() });
+    res.end(`Invalid or forbidden upstream URL: ${err.message}`);
+    return;
+  }
+
+  const outboundHeaders = { ...req.headers };
+  outboundHeaders["host"] = target.host;
+
+  // Clean infrastructure headers
+  delete outboundHeaders["x-forwarded-for"];
+  delete outboundHeaders["x-forwarded-proto"];
+  delete outboundHeaders["x-forwarded-host"];
+
+  const options = {
+    method: req.method,
+    headers: outboundHeaders,
+  };
+
+  const upstreamReq = https.request(target, options, (upstreamRes) => {
+    const responseHeaders = { ...upstreamRes.headers, ...getCorsHeaders() };
+
+    if (upstreamRes.statusCode && [301, 302, 307, 308].includes(upstreamRes.statusCode) && responseHeaders.location) {
+      try {
+        const redirectUrl = new URL(responseHeaders.location, target.href);
+        responseHeaders.location = `/proxy/${encodeURIComponent(redirectUrl.href)}`;
+      } catch {
+        // Keep default routing path if fallback parsing misses
+      }
+    }
+
+    res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
+    upstreamRes.pipe(res);
+  });
+
+  upstreamReq.on("error", (err) => {
+    console.error("Upstream Request Error:", err);
+    res.writeHead(502, { "Content-Type": "text/plain", ...getCorsHeaders() });
+    res.end("Bad Gateway: Proxy server could not communicate with the upstream.");
+  });
+
+  req.pipe(upstreamReq);
+});
+
+server.listen(PORT, () => {
+  console.log("Proxy server successfully running under Deno.");
+  console.log(`Listening on local entry: http://localhost:${PORT}/`);
 });
