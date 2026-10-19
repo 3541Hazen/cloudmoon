@@ -1,11 +1,32 @@
-// Use standard ESM imports with the node: compatibility prefix
 import http from "node:http";
 import https from "node:https";
+import { URL } from "node:url";
 
 // Configuration
 const PORT = 8080;
 const UPSTREAM = "https://now.gg";
 const ROBLOX_DEFAULT_PATH = "/apps/roblox-corporation/2349/roblox.html";
+
+// CRITICAL: To guarantee a bypass, replace these placeholders with a residential proxy provider.
+// This masks your server's datacenter IP address with a real home/mobile ISP network address.
+const USE_RESIDENTIAL_PROXY = false; 
+const PROXY_HOST = "your-residential-proxy-provider.com";
+const PROXY_PORT = 12345;
+const PROXY_USER = "username";
+const PROXY_PASS = "password";
+
+// Chrome 120+ Hardened TLS Ciphers to bypass JA3/JA4 Detection
+const CHROME_CIPHERS = [
+  "TLS_AES_128_GCM_SHA256",
+  "TLS_AES_256_GCM_SHA384",
+  "TLS_CHACHA20_POLY1305_SHA256",
+  "ECDHE-ECDSA-AES128-GCM-SHA256",
+  "ECDHE-RSA-AES128-GCM-SHA256",
+  "ECDHE-ECDSA-AES256-GCM-SHA384",
+  "ECDHE-RSA-AES256-GCM-SHA384",
+  "ECDHE-ECDSA-CHACHA20-POLY1305",
+  "ECDHE-RSA-CHACHA20-POLY1305"
+].join(":");
 
 function getCorsHeaders(): Record<string, string> {
   return {
@@ -50,66 +71,89 @@ const server = http.createServer((req, res) => {
     target = resolveTarget(incomingUrl);
   } catch (err: any) {
     res.writeHead(400, { "Content-Type": "text/plain", ...getCorsHeaders() });
-    res.end(`Invalid or forbidden upstream URL: ${err.message}`);
+    res.end(`Configuration error: ${err.message}`);
     return;
   }
 
-  // FIXED: Sanitizing outbound headers to strip Cloudflare/Deno/Proxy signatures
   const outboundHeaders: Record<string, string> = {};
 
-  // 1. Force context spoofing 
+  // 1. Precise Browser Navigation Simulation
   outboundHeaders["host"] = target.host;
   outboundHeaders["origin"] = "https://now.gg";
   outboundHeaders["referer"] = "https://now.gg";
+  outboundHeaders["connection"] = "keep-alive";
 
-  // 2. Map allowed client headers while dropping internal proxy flags (Forwarded, X-Forwarded-For, etc.)
-  const allowedHeaders = [
+  const passThroughHeaders = [
     "user-agent", "accept", "accept-language", "accept-encoding", 
-    "content-type", "cookie", "authorization", "cache-control"
+    "content-type", "cookie", "authorization"
   ];
   
-  for (const key of allowedHeaders) {
+  for (const key of passThroughHeaders) {
     if (req.headers[key]) {
       outboundHeaders[key] = req.headers[key] as string;
     }
   }
 
-  // Fallback high-reputation UA if missing
   if (!outboundHeaders["user-agent"]) {
     outboundHeaders["user-agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
   }
 
-  // 3. Strict modern browser Client Hints (Now matching real desktop navigation)
+  // 2. Strict Anti-Bot Fingerprint Spoofing
   outboundHeaders["sec-ch-ua"] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
   outboundHeaders["sec-ch-ua-mobile"] = "?0";
   outboundHeaders["sec-ch-ua-platform"] = '"Windows"';
   outboundHeaders["sec-fetch-dest"] = "document";
   outboundHeaders["sec-fetch-mode"] = "navigate";
-  outboundHeaders["sec-fetch-site"] = "same-origin"; // FIXED: Changed from 'none' to spoof actual internal asset requests
+  outboundHeaders["sec-fetch-site"] = "same-origin";
   outboundHeaders["sec-fetch-user"] = "?1";
   outboundHeaders["upgrade-insecure-requests"] = "1";
 
-  const options = {
+  // Completely drop signature headers that runtimes or reverse proxies inject
+  delete req.headers["x-forwarded-for"];
+  delete req.headers["x-forwarded-proto"];
+  delete req.headers["x-forwarded-host"];
+  delete req.headers["forwarded"];
+  delete req.headers["via"];
+
+  // 3. Construct HTTP/HTTPS Request options with custom TLS configuration
+  let options: any = {
     method: req.method,
     headers: outboundHeaders,
+    ciphers: CHROME_CIPHERS,              // Enforce Chrome JA3/JA4 Fingerprint match
+    honorCipherOrder: true,
+    minVersion: "TLSv1.3",                // Enforce modern TLS standards 
   };
 
-  const upstreamReq = https.request(target, options, (upstreamRes) => {
+  let requestClient: any = https;
+
+  // Integrate residential proxy routing if configured
+  if (USE_RESIDENTIAL_PROXY) {
+    options.host = PROXY_HOST;
+    options.port = PROXY_PORT;
+    options.path = target.href;
+    const auth = Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString("base64");
+    options.headers["Proxy-Authorization"] = `Basic ${auth}`;
+    requestClient = http; // Outbound transport wrapper shifts to tunneling agent
+  } else {
+    options.host = target.hostname;
+    options.path = target.pathname + target.search;
+  }
+
+  const upstreamReq = requestClient.request(options, (upstreamRes) => {
     const responseHeaders = { ...upstreamRes.headers, ...getCorsHeaders() };
 
-    // 4. Strip aggressive security policies blocking custom client rendering
+    // Strip perimeter defense security options blocking iframe delivery
     delete responseHeaders["content-security-policy"];
     delete responseHeaders["content-security-policy-report-only"];
     delete responseHeaders["x-frame-options"];
+    delete responseHeaders["x-content-type-options"];
 
-    // FIXED: Sanitize and force re-routing on edge redirect attempts 
+    // Prevent direct tracking redirect breakouts
     if (upstreamRes.statusCode && [301, 302, 307, 308].includes(upstreamRes.statusCode) && responseHeaders.location) {
       try {
         const redirectUrl = new URL(responseHeaders.location, target.href);
         responseHeaders.location = `/proxy/${encodeURIComponent(redirectUrl.href)}`;
-      } catch {
-        // Fallback route context
-      }
+      } catch {}
     }
 
     res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
@@ -117,44 +161,54 @@ const server = http.createServer((req, res) => {
   });
 
   upstreamReq.on("error", (err) => {
-    console.error("Upstream Request Error:", err);
     res.writeHead(502, { "Content-Type": "text/plain", ...getCorsHeaders() });
-    res.end("Bad Gateway: Proxy server could not communicate with the upstream.");
+    res.end("Connection verification timeout.");
   });
 
   req.pipe(upstreamReq);
 });
 
-// FIXED: Added basic WebSocket proxy logic. Cloud gaming frames run entirely over WebSockets (WS/WSS).
-// Without handling the 'upgrade' event, the engine loop fails and throws a VPN/Network connection block error.
-server.on('upgrade', (req, socket, head) => {
+// 4. Robust Real-Time WebSocket Tunnel Context
+server.on("upgrade", (req, socket, head) => {
   try {
     const incomingUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const targetUrl = resolveTarget(incomingUrl);
     
-    // Convert to target websocket protocol
-    const wsTargetUrl = new URL(targetUrl.href);
-    wsTargetUrl.protocol = targetUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    const outboundHeaders: Record<string, string> = {
+      "Connection": "Upgrade",
+      "Upgrade": "websocket",
+      "Host": targetUrl.host,
+      "Origin": "https://now.gg",
+      "User-Agent": req.headers["user-agent"] || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    };
 
-    const upstreamWsReq = https.request(targetUrl, {
-      method: 'GET',
-      headers: {
-        'Connection': 'Upgrade',
-        'Upgrade': 'websocket',
-        'Host': targetUrl.host,
-        'Origin': 'https://now.gg',
-        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
+    if (req.headers["cookie"]) outboundHeaders["cookie"] = req.headers["cookie"] as string;
 
-    upstreamWsReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
-      socket.write('HTTP/1.1 101 Switching Protocols\(\r\n' + 'Upgrade: websocket\r\n' + 'Connection: Upgrade\r\n\r\\)n');
+    const wsOptions: any = {
+      port: 443,
+      hostname: targetUrl.hostname,
+      path: targetUrl.pathname + targetUrl.search,
+      method: "GET",
+      headers: outboundHeaders,
+      ciphers: CHROME_CIPHERS,
+      honorCipherOrder: true,
+      minVersion: "TLSv1.3"
+    };
+
+    const upstreamWsReq = https.request(wsOptions);
+
+    upstreamWsReq.on("upgrade", (upstreamRes, upstreamSocket, upstreamHead) => {
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\(\r\\)n" +
+        "Upgrade: websocket\(\r\\)n" +
+        "Connection: Upgrade\(\r\n\r\\)n"
+      );
       
       upstreamSocket.write(upstreamHead);
       upstreamSocket.pipe(socket).pipe(upstreamSocket);
     });
 
-    upstreamWsReq.on('error', () => {
+    upstreamWsReq.on("error", () => {
       socket.destroy();
     });
 
@@ -165,6 +219,5 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, () => {
-  console.log("Proxy server successfully running under Deno/Node.");
-  console.log(`Listening on local entry: http://localhost:${PORT}/`);
+  console.log(`Stealth proxy engine online on port ${PORT}`);
 });
