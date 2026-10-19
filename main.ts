@@ -54,31 +54,38 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Bypassing detection by constructing completely clean, stealthy headers
+  // FIXED: Sanitizing outbound headers to strip Cloudflare/Deno/Proxy signatures
   const outboundHeaders: Record<string, string> = {};
 
-  // 1. Spoof target context & break cloud proxy signatures
+  // 1. Force context spoofing 
   outboundHeaders["host"] = target.host;
   outboundHeaders["origin"] = "https://now.gg";
   outboundHeaders["referer"] = "https://now.gg";
 
-  // 2. Pass standard runtime headers if they exist, but pass clean fallbacks
-  outboundHeaders["user-agent"] = (req.headers["user-agent"] as string) || 
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  // 2. Map allowed client headers while dropping internal proxy flags (Forwarded, X-Forwarded-For, etc.)
+  const allowedHeaders = [
+    "user-agent", "accept", "accept-language", "accept-encoding", 
+    "content-type", "cookie", "authorization", "cache-control"
+  ];
   
-  if (req.headers["accept"]) outboundHeaders["accept"] = req.headers["accept"] as string;
-  if (req.headers["accept-language"]) outboundHeaders["accept-language"] = req.headers["accept-language"] as string;
-  if (req.headers["accept-encoding"]) outboundHeaders["accept-encoding"] = req.headers["accept-encoding"] as string;
-  if (req.headers["content-type"]) outboundHeaders["content-type"] = req.headers["content-type"] as string;
-  if (req.headers["cookie"]) outboundHeaders["cookie"] = req.headers["cookie"] as string;
+  for (const key of allowedHeaders) {
+    if (req.headers[key]) {
+      outboundHeaders[key] = req.headers[key] as string;
+    }
+  }
 
-  // 3. Append Client Hints to look like a standard Google Chrome asset request
+  // Fallback high-reputation UA if missing
+  if (!outboundHeaders["user-agent"]) {
+    outboundHeaders["user-agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  }
+
+  // 3. Strict modern browser Client Hints (Now matching real desktop navigation)
   outboundHeaders["sec-ch-ua"] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
   outboundHeaders["sec-ch-ua-mobile"] = "?0";
   outboundHeaders["sec-ch-ua-platform"] = '"Windows"';
   outboundHeaders["sec-fetch-dest"] = "document";
   outboundHeaders["sec-fetch-mode"] = "navigate";
-  outboundHeaders["sec-fetch-site"] = "none";
+  outboundHeaders["sec-fetch-site"] = "same-origin"; // FIXED: Changed from 'none' to spoof actual internal asset requests
   outboundHeaders["sec-fetch-user"] = "?1";
   outboundHeaders["upgrade-insecure-requests"] = "1";
 
@@ -90,16 +97,18 @@ const server = http.createServer((req, res) => {
   const upstreamReq = https.request(target, options, (upstreamRes) => {
     const responseHeaders = { ...upstreamRes.headers, ...getCorsHeaders() };
 
-    // Update CSP and Frame options to prevent your site context from getting blocked locally
+    // 4. Strip aggressive security policies blocking custom client rendering
     delete responseHeaders["content-security-policy"];
+    delete responseHeaders["content-security-policy-report-only"];
     delete responseHeaders["x-frame-options"];
 
+    // FIXED: Sanitize and force re-routing on edge redirect attempts 
     if (upstreamRes.statusCode && [301, 302, 307, 308].includes(upstreamRes.statusCode) && responseHeaders.location) {
       try {
         const redirectUrl = new URL(responseHeaders.location, target.href);
         responseHeaders.location = `/proxy/${encodeURIComponent(redirectUrl.href)}`;
       } catch {
-        // Keep default routing path if fallback parsing misses
+        // Fallback route context
       }
     }
 
@@ -108,7 +117,7 @@ const server = http.createServer((req, res) => {
   });
 
   upstreamReq.on("error", (err) => {
-    console.error("Upstream Request Error: ", err);
+    console.error("Upstream Request Error:", err);
     res.writeHead(502, { "Content-Type": "text/plain", ...getCorsHeaders() });
     res.end("Bad Gateway: Proxy server could not communicate with the upstream.");
   });
@@ -116,7 +125,46 @@ const server = http.createServer((req, res) => {
   req.pipe(upstreamReq);
 });
 
+// FIXED: Added basic WebSocket proxy logic. Cloud gaming frames run entirely over WebSockets (WS/WSS).
+// Without handling the 'upgrade' event, the engine loop fails and throws a VPN/Network connection block error.
+server.on('upgrade', (req, socket, head) => {
+  try {
+    const incomingUrl = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const targetUrl = resolveTarget(incomingUrl);
+    
+    // Convert to target websocket protocol
+    const wsTargetUrl = new URL(targetUrl.href);
+    wsTargetUrl.protocol = targetUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+
+    const upstreamWsReq = https.request(targetUrl, {
+      method: 'GET',
+      headers: {
+        'Connection': 'Upgrade',
+        'Upgrade': 'websocket',
+        'Host': targetUrl.host,
+        'Origin': 'https://now.gg',
+        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+
+    upstreamWsReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+      socket.write('HTTP/1.1 101 Switching Protocols\(\r\n' + 'Upgrade: websocket\r\n' + 'Connection: Upgrade\r\n\r\\)n');
+      
+      upstreamSocket.write(upstreamHead);
+      upstreamSocket.pipe(socket).pipe(upstreamSocket);
+    });
+
+    upstreamWsReq.on('error', () => {
+      socket.destroy();
+    });
+
+    upstreamWsReq.end();
+  } catch (err) {
+    socket.destroy();
+  }
+});
+
 server.listen(PORT, () => {
-  console.log("Proxy server successfully running under Deno.");
+  console.log("Proxy server successfully running under Deno/Node.");
   console.log(`Listening on local entry: http://localhost:${PORT}/`);
 });
